@@ -65,6 +65,24 @@ class ContinueReplayTests(unittest.TestCase):
         added = self.messages.get_recent(100)[count_before:]
         self.assertTrue(all(m["sender"] in ("user", "system") for m in added))
 
+    def _prompts(self):
+        return [c.kwargs.get("prompt", "") for c in self.agents.trigger.await_args_list]
+
+    def test_replay_prompt_says_a_human_resumed_the_chain(self):
+        self._trip_guard()
+        self._continue_http()
+        [prompt] = self._prompts()
+        # The agent will see the earlier 'Loop guard' system message in history;
+        # the wake prompt must tell it that pause is over.
+        self.assertIn("#work", prompt)
+        self.assertIn("human", prompt.lower())
+        self.assertIn("resumed", prompt.lower())
+        self.assertIn("no longer paused", prompt.lower())
+
+    def test_ordinary_mention_keeps_default_prompt(self):
+        self._agent_message("user", "@claude hi")
+        self.assertEqual(self._prompts(), [""])
+
     def _websocket_continue(self, sender):
         events = [json.dumps({"type": "message", "text": "/continue",
                               "sender": sender, "channel": "work"})]
@@ -123,6 +141,9 @@ class ContinueReplayTests(unittest.TestCase):
         self.agents.trigger.assert_not_awaited()
         self._continue_http()
         self.assertEqual(self._job_triggers(), [("claude", "work", 7)])
+        [prompt] = self._prompts()
+        self.assertIn("job_id=7", prompt)
+        self.assertIn("no longer paused", prompt.lower())
 
     def test_job_message_blocked_via_mcp_is_replayed_into_job(self):
         import mcp_bridge

@@ -29,6 +29,7 @@ agents = None         # set by run.py — AgentManager instance
 _presence: dict[str, float] = {}
 _activity: dict[str, bool] = {}   # True = screen changed on last poll
 _activity_ts: dict[str, float] = {}  # timestamp of last active=True heartbeat
+_approval_wait: dict[str, bool] = {}  # wrapper sees a terminal approval prompt
 ACTIVITY_TIMEOUT = 8  # auto-expire activity after 8s without a fresh active=True
 _presence_lock = threading.Lock()   # guards both _presence and _activity
 _renamed_from: set[str] = set()    # old names from renames — suppress leave messages
@@ -508,6 +509,8 @@ def migrate_identity(old_name: str, new_name: str):
             _activity[new_name] = _activity.pop(old_name)
         if old_name in _activity_ts:
             _activity_ts[new_name] = _activity_ts.pop(old_name)
+        if old_name in _approval_wait:
+            _approval_wait[new_name] = _approval_wait.pop(old_name)
         _renamed_from.add(old_name)  # suppress leave message for old name
     with _cursors_lock:
         if old_name in _cursors:
@@ -529,6 +532,7 @@ def purge_identity(name: str):
         _presence.pop(name, None)
         _activity.pop(name, None)
         _activity_ts.pop(name, None)
+        _approval_wait.pop(name, None)
     with _cursors_lock:
         _cursors.pop(name, None)
     with _last_read_lock:
@@ -825,6 +829,22 @@ def set_active(name: str, active: bool):
         _activity[name] = active
         if active:
             _activity_ts[name] = __import__("time").time()
+
+
+def set_waiting_approval(name: str, waiting: bool) -> bool:
+    """Set the reported approval state; return whether it changed."""
+    with _presence_lock:
+        previous = _approval_wait.get(name, False)
+        if waiting:
+            _approval_wait[name] = True
+        else:
+            _approval_wait.pop(name, None)
+        return previous != waiting
+
+
+def is_waiting_approval(name: str) -> bool:
+    with _presence_lock:
+        return _approval_wait.get(name, False)
 
 
 def is_active(name: str) -> bool:

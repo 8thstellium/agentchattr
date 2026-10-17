@@ -399,6 +399,346 @@ def _register_instance(server_port: int, base: str, label: str | None = None) ->
         return json.loads(reg_resp.read())
 
 
+def _post_register(server_port: int, body: dict) -> tuple[int, dict]:
+    """POST /api/register; returns (status, json) instead of raising on 409."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{server_port}/api/register",
+        method="POST",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code != 409:
+            raise
+        return exc.code, json.loads(exc.read() or b"{}")
+
+
+def _post_deregister(server_port: int, name: str, token: str, body: dict):
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{server_port}/api/deregister/{name}",
+        method="POST",
+        data=json.dumps(body).encode(),
+        headers=_auth_headers(token, include_json=True),
+    )
+    urllib.request.urlopen(req, timeout=3)
+
+
+# ---------------------------------------------------------------------------
+# Identity takeover (F3): a relaunched wrapper takes back its own stale identity
+# ---------------------------------------------------------------------------
+
+CTRL_CLOSE_EVENT = 2
+_CLOSE_EVENTS = (CTRL_CLOSE_EVENT, 5, 6)  # close, logoff, shutdown
+
+
+def _token_dir(data_dir: Path) -> Path:
+    return data_dir / "wrapper-tokens"
+
+
+def _restrict_permissions(path: Path):
+    """Make `path` accessible to the current user only. Raises if that fails."""
+    if os.name != "nt":
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+        return
+    import subprocess
+
+    user = os.environ.get("USERNAME", "")
+    domain = os.environ.get("USERDOMAIN", "")
+    principal = f"{domain}\\{user}" if domain else user
+    # The folder's ACE is inheritable so new files start user-only; without it
+    # Windows falls back to the token's default DACL (Administrators, SYSTEM).
+    rights = "(OI)(CI)F" if path.is_dir() else "F"
+    subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{principal}:{rights}"],
+                   check=True, capture_output=True)
+
+
+def _save_token_file(data_dir: Path, entry: dict, pid: int | None = None) -> Path:
+    """Persist this wrapper's instance token, readable only by the current user.
+
+    The file is named by a hash of the token, so a rotated token gets a new file
+    and two wrappers racing for one identity never delete each other's file.
+    """
+    import hashlib
+
+    folder = _token_dir(data_dir)
+    if not folder.exists():
+        folder.mkdir(parents=True)
+        _restrict_permissions(folder)
+    digest = hashlib.sha256(entry["token"].encode()).hexdigest()[:16]
+    path = folder / f"{entry['base']}-{digest}.json"
+    record = {k: entry[k] for k in ("base", "name", "identity_id", "token")}
+    record["pid"] = os.getpid() if pid is None else pid
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.close(fd)
+    try:
+        _restrict_permissions(tmp)  # before the token is written
+        tmp.write_text(json.dumps(record), "utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return path
+
+
+def _load_token_files(data_dir: Path, base: str) -> list[dict]:
+    found = []
+    for path in _token_dir(data_dir).glob("*.json"):
+        try:
+            # Another wrapper may delete the file between listing and reading it.
+            mtime = path.stat().st_mtime
+            record = json.loads(path.read_text("utf-8"))
+        except Exception:
+            continue
+        if isinstance(record, dict) and record.get("base") == base and record.get("token"):
+            record["path"] = path
+            record["mtime"] = mtime
+            found.append(record)
+    return found
+
+
+def _pid_alive(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reclaim_candidates(data_dir: Path, base: str) -> list[dict]:
+    """Saved tokens of dead wrappers of `base`, newest first. Live owners are skipped."""
+    records = [r for r in _load_token_files(data_dir, base) if not _pid_alive(r.get("pid"))]
+    return sorted(records, key=lambda r: r["mtime"], reverse=True)
+
+
+def _append_claim(claimed: Path, target: Path):
+    text = claimed.read_text("utf-8")
+    if text:
+        if not text.endswith("\n"):
+            text += "\n"
+        if target.exists() and target.stat().st_size:
+            with open(target, "rb") as f:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    text = "\n" + text
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(text)
+    claimed.unlink()
+
+
+def _finish_claims(data_dir: Path, name: str):
+    """Append claims into `name`'s queue that a crash left behind."""
+    claims = sorted(data_dir.glob(f"{name}_queue.from-*.migrating"),
+                    key=lambda p: p.stat().st_mtime)
+    for claimed in claims:
+        _append_claim(claimed, data_dir / f"{name}_queue.jsonl")
+
+
+def _pending_marker(data_dir: Path, old_name: str, new_name: str) -> Path:
+    return data_dir / f"{new_name}_queue.from-{old_name}.pending"
+
+
+def _has_pending_migrations(data_dir: Path, name: str) -> bool:
+    return any(data_dir.glob(f"{name}_queue.from-*.pending"))
+
+
+def _recover_queue_claims(data_dir: Path, name: str):
+    """Finish every migration into `name`'s queue: crash-interrupted claims, and
+    migrations recorded by a .pending marker that have not succeeded yet."""
+    _finish_claims(data_dir, name)
+    prefix = f"{name}_queue.from-"
+    for marker in data_dir.glob(f"{prefix}*.pending"):
+        _migrate_queue(data_dir, marker.name[len(prefix):-len(".pending")], name)
+        marker.unlink()
+
+
+def _migrate_queue(data_dir: Path, old_name: str, new_name: str):
+    """Move undelivered wake-ups from old_name's queue files onto new_name's queue.
+
+    Each source is first claimed by renaming it to a file that names its target, so
+    a crash between claim and append leaves something _recover_queue_claims finds.
+    """
+    if old_name == new_name:
+        return
+    _finish_claims(data_dir, new_name)  # never overwrite an unrecovered claim
+    target = data_dir / f"{new_name}_queue.jsonl"
+    for source in (data_dir / f"{old_name}_queue.processing",
+                   data_dir / f"{old_name}_queue.jsonl"):
+        claimed = data_dir / f"{new_name}_queue.from-{source.name}.migrating"
+        try:
+            # Claim first: a writer appending meanwhile creates a fresh file.
+            os.replace(source, claimed)
+        except FileNotFoundError:
+            continue
+        _append_claim(claimed, target)
+
+
+def _acquire_identity(register, data_dir: Path, base: str, label: str | None = None,
+                      *, sleep=time.sleep, max_wait: float = 20) -> dict:
+    """Register, preferring to take over this base's identity left by a dead wrapper.
+
+    `register(body) -> (status, json)`. A 409 identity_in_use means the old owner
+    still looks alive to the server (its last heartbeat is recent); wait for that to
+    lapse up to `max_wait` seconds, then fall back to a fresh registration.
+    """
+    candidates = _reclaim_candidates(data_dir, base)
+    offered = list(candidates)
+    waited = 0
+    while True:
+        body = {"base": base, "label": label}
+        if candidates:
+            body["reclaim"] = [{"token": c["token"], "name": c["name"]} for c in candidates]
+        status, reg = register(body)
+        if status == 409 and candidates and reg.get("error") == "identity_in_use":
+            delay = reg.get("retry_after", 5)
+            if waited + delay > max_wait:
+                candidates = []
+            else:
+                sleep(delay)
+                waited += delay
+            continue
+        if status != 200:
+            raise RuntimeError(f"registration failed ({status}): {reg}")
+        break
+
+    # Save the rotated token before anything that can fail: the old one is dead now.
+    try:
+        reg["token_path"] = _save_token_file(data_dir, {**reg, "base": base})
+    except Exception as exc:
+        print(f"  Warning: could not save identity token ({exc}); a relaunch will get a new name.")
+    dead = set(reg.get("dead_tokens", []))
+    for c in offered:
+        if c["token"] in dead or c.get("identity_id") == reg.get("identity_id"):
+            c["path"].unlink(missing_ok=True)
+
+    # Record the migration durably first; the marker stays until it succeeds, so
+    # a later retry or the next startup finishes it.
+    if reg.get("migrate_queue_from"):
+        try:
+            _pending_marker(data_dir, reg["migrate_queue_from"], reg["name"]).touch()
+        except OSError:
+            pass
+    # Queue files may be briefly held open by the server's writer; retry, then
+    # leave them for _retry_pending_migrations rather than fail startup.
+    for attempt in range(5):
+        try:
+            _recover_queue_claims(data_dir, reg["name"])
+            break
+        except OSError as exc:
+            if attempt == 4:
+                print(f"  Warning: could not move queued wake-ups yet ({exc}); will retry.")
+            else:
+                sleep(0.2)
+    return reg
+
+
+def _retry_pending_migrations(data_dir: Path, get_name, *, sleep=time.sleep, interval=5):
+    """Keep finishing recorded queue migrations until none remain.
+
+    The markers follow this wrapper's name: if it is renamed meanwhile (e.g. slot 1
+    becoming base-1 when a second instance joins), they are retargeted to the new
+    name, whose queue the wrapper now watches.
+    """
+    target = [get_name()]
+
+    def follow_rename():
+        current = get_name()
+        if current == target[0]:
+            return
+        prefix = f"{target[0]}_queue.from-"
+        for marker in data_dir.glob(f"{prefix}*.pending"):
+            try:
+                os.replace(marker, data_dir / f"{current}_queue.from-{marker.name[len(prefix):]}")
+            except OSError:
+                pass
+        target[0] = current
+
+    while True:
+        follow_rename()
+        if not _has_pending_migrations(data_dir, target[0]):
+            return
+        sleep(interval)
+        follow_rename()
+        try:
+            _recover_queue_claims(data_dir, target[0])
+        except OSError:
+            pass
+
+
+def _deregister(post, name: str, token: str, token_path: Path | None, *, reclaimable: bool):
+    """Deregister this wrapper. A deliberate exit also forgets the saved token."""
+    try:
+        post(name, token, {"reclaimable": reclaimable})
+        return True
+    except Exception:
+        return False
+    finally:
+        if not reclaimable and token_path is not None:
+            token_path.unlink(missing_ok=True)
+
+
+def _console_ctrl_handler(on_close):
+    """Build a console control handler that runs `on_close` once on close/logoff/shutdown.
+
+    Ctrl+C / Ctrl+Break return False so their default handling still applies.
+    """
+    fired = threading.Lock()
+
+    def handler(event) -> bool:
+        if event not in _CLOSE_EVENTS:
+            return False
+        if fired.acquire(blocking=False):
+            on_close()
+        return True
+
+    return handler
+
+
+def _install_shutdown_handler(on_close):
+    """Run `on_close` when the console window closes (Windows) or on SIGTERM/SIGHUP."""
+    handler = _console_ctrl_handler(on_close)
+    if os.name == "nt":
+        import ctypes
+
+        routine = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_ulong)(lambda e: int(handler(e)))
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(routine, True)
+        return routine  # caller keeps the reference alive
+    import signal
+
+    def on_signal(signum, frame):
+        handler(CTRL_CLOSE_EVENT)
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+    return on_signal
+
+
 def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
     headers = {"Authorization": f"Bearer {token}"}
     if include_json:
@@ -577,6 +917,12 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
 # Main
 # ---------------------------------------------------------------------------
 
+def _build_activity_report(checker):
+    """Translate the console checker state into the heartbeat payload."""
+    state = checker()
+    return {"active": state is True, "waiting_approval": state == "waiting_approval"}
+
+
 def main():
     import argparse
     import urllib.error
@@ -616,7 +962,9 @@ def main():
     mcp_cfg = config.get("mcp", {})
 
     try:
-        registration = _register_instance(server_port, agent, args.label)
+        # Takes back this agent's identity from a dead wrapper when it can (F3).
+        registration = _acquire_identity(lambda body: _post_register(server_port, body),
+                                         data_dir, agent, args.label)
     except Exception as exc:
         print(f"  Registration failed ({exc}).")
         print("  Wrapper cannot continue without a registered identity.")
@@ -624,7 +972,8 @@ def main():
 
     assigned_name = registration["name"]
     assigned_token = registration["token"]
-    print(f"  Registered as: {assigned_name} (slot {registration.get('slot', '?')})")
+    reclaimed = " - took over previous session" if registration.get("reclaimed") else ""
+    print(f"  Registered as: {assigned_name} (slot {registration.get('slot', '?')}){reclaimed}")
 
     proxy = None
     proxy_url = None
@@ -667,6 +1016,8 @@ def main():
         "name": assigned_name,
         "queue": data_dir / f"{assigned_name}_queue.jsonl",
         "token": assigned_token,
+        "identity_id": registration.get("identity_id", ""),
+        "token_path": registration.get("token_path"),
     }
 
     def get_identity():
@@ -676,6 +1027,10 @@ def main():
     def get_token():
         with _identity_lock:
             return _identity["token"]
+
+    if _has_pending_migrations(data_dir, assigned_name):
+        threading.Thread(target=_retry_pending_migrations,
+                         args=(data_dir, lambda: get_identity()[0]), daemon=True).start()
 
     # Rewrite MCP config when token/name changes (e.g. after 409 re-register).
     # Most CLIs won't re-read mid-session, but the file is correct for next restart.
@@ -691,10 +1046,28 @@ def main():
         except Exception:
             pass
 
-    def set_runtime_identity(new_name: str | None = None, new_token: str | None = None):
+    def _resave_token_file():
+        """Keep the saved token in step with a rename or re-registration."""
+        with _identity_lock:
+            entry = {"base": agent, "name": _identity["name"],
+                     "identity_id": _identity["identity_id"], "token": _identity["token"]}
+            old_path = _identity["token_path"]
+        try:
+            new_path = _save_token_file(data_dir, entry)
+        except Exception:
+            return
+        with _identity_lock:
+            _identity["token_path"] = new_path
+        if old_path and old_path != new_path:
+            old_path.unlink(missing_ok=True)
+
+    def set_runtime_identity(new_name: str | None = None, new_token: str | None = None,
+                             new_identity_id: str | None = None):
         with _identity_lock:
             old_name = _identity["name"]
             old_token = _identity["token"]
+            if new_identity_id:
+                _identity["identity_id"] = new_identity_id
             changed = False
             if new_name and new_name != old_name:
                 _identity["name"] = new_name
@@ -715,6 +1088,7 @@ def main():
             if new_token and new_token != old_token:
                 print(f"  Session refreshed for @{current_name}")
             _rewrite_mcp_config(current_name, current_token)
+            _resave_token_file()
 
         return changed
 
@@ -781,7 +1155,8 @@ def main():
                 if exc.code == 409:
                     try:
                         replacement = _register_instance(server_port, agent, args.label)
-                        set_runtime_identity(replacement["name"], replacement["token"])
+                        set_runtime_identity(replacement["name"], replacement["token"],
+                                             replacement.get("identity_id"))
                         _notify_recovery(data_dir, replacement["name"])
                     except Exception:
                         pass
@@ -840,7 +1215,7 @@ def main():
         _activity_checker = checker
 
     def _activity_monitor():
-        last_active = None
+        last_state = None
         last_report_time = 0
         REPORT_INTERVAL = 3  # re-send state every 3s while active (keeps server lease fresh)
         while True:
@@ -848,21 +1223,22 @@ def main():
             if not _activity_checker:
                 continue
             try:
-                active = _activity_checker()
+                report = _build_activity_report(_activity_checker)
+                state = (report["active"], report["waiting_approval"])
                 now = time.time()
                 # Send on state change, periodically while active (refresh lease),
                 # or periodically while idle (keep presence alive)
                 IDLE_REPORT_INTERVAL = 8  # keep-alive while idle
                 should_send = (
-                    active != last_active
-                    or (active and now - last_report_time >= REPORT_INTERVAL)
-                    or (not active and now - last_report_time >= IDLE_REPORT_INTERVAL)
+                    state != last_state
+                    or (any(state) and now - last_report_time >= REPORT_INTERVAL)
+                    or (not any(state) and now - last_report_time >= IDLE_REPORT_INTERVAL)
                 )
                 if should_send:
                     current_name, _ = get_identity()
                     current_token = get_token()
                     url = f"http://127.0.0.1:{server_port}/api/heartbeat/{current_name}"
-                    body = json.dumps({"active": active}).encode()
+                    body = json.dumps(report).encode()
                     req = urllib.request.Request(
                         url,
                         method="POST",
@@ -871,7 +1247,7 @@ def main():
                     )
                     resp = urllib.request.urlopen(req, timeout=5)
                     resp_code = resp.getcode()
-                    last_active = active
+                    last_state = state
                     last_report_time = now
             except Exception:
                 pass
@@ -913,22 +1289,29 @@ def main():
     if sys.platform != "win32":
         run_kwargs["session_name"] = unix_session_name
 
+    def _deregister_current(reclaimable: bool):
+        current_name, _ = get_identity()
+        with _identity_lock:
+            current_token, token_path = _identity["token"], _identity["token_path"]
+        if _deregister(lambda n, t, b: _post_deregister(server_port, n, t, b),
+                       current_name, current_token, token_path, reclaimable=reclaimable):
+            print(f"  Deregistered {current_name}")
+
+    # Console closed / SIGTERM: deregister but keep the token, so a relaunch takes
+    # this identity back. A normal exit below is deliberate and forgets the token.
+    _closing = threading.Event()
+
+    def _close_reclaimable():
+        _closing.set()
+        _deregister_current(reclaimable=True)
+
+    _shutdown_handler_ref = _install_shutdown_handler(_close_reclaimable)  # noqa: F841 (keep alive)
+
     try:
         run_agent(**run_kwargs)
     finally:
-        try:
-            current_name, _ = get_identity()
-            current_token = get_token()
-            dereg_req = urllib.request.Request(
-                f"http://127.0.0.1:{server_port}/api/deregister/{current_name}",
-                method="POST",
-                data=b"",
-                headers=_auth_headers(current_token),
-            )
-            urllib.request.urlopen(dereg_req, timeout=5)
-            print(f"  Deregistered {current_name}")
-        except Exception:
-            pass
+        if not _closing.is_set():
+            _deregister_current(reclaimable=False)
 
         if proxy is not None:
             proxy.stop()
