@@ -776,6 +776,66 @@ _IDENTITY_HINT = (
     "pill at the top.)"
 )
 
+# Appended to every wake prompt: one read, act, at most one reply, end the turn.
+_WAKE_STEPS = (
+    "Call chat_read once with your sender name (it returns only unread messages), "
+    "do what the message asks, call chat_send once if a reply is needed, then END YOUR TURN. "
+    "Do not call chat_who, or chat_rules to list rules (rules are included below when they change). "
+    "Never wait by sleeping or re-reading; the room wakes you when there is something new. "
+    "Acknowledge with chat_react(msg_id=<id>, emoji='✅', sender=<your name>), not a message, "
+    "and with no @mention. @mention another agent only when they must act."
+)
+
+_NEW_SESSION_STEPS = (
+    "NEW SESSION: before anything else call chat_join(name=<your name>, channel='{channel}'), "
+    "then chat_summary(action='read', sender=<your name>, channel='{channel}'). "
+)
+
+
+def _session_marker(path: Path | None) -> str | None:
+    """The CLI session that already received its new-session wake prompt."""
+    if path is None:
+        return None
+    try:
+        return json.loads(path.read_text("utf-8")).get("session")
+    except Exception:
+        return None
+
+
+def _save_session_marker(path: Path, session: str):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"session": session}), "utf-8")
+    os.replace(tmp, path)
+
+
+def _is_restart_line(line: str) -> bool:
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(data, dict) and data.get("type") == "restart"
+
+
+def _restart_cli(pid_holder: list, restart_event: threading.Event, kill_fn, *,
+                 sleep=time.sleep, timeout: float = 60, boot_grace: float = 8):
+    """Stop the CLI and wait until the run loop has launched a fresh one.
+
+    The wrapper itself keeps running, so its identity, token, proxy and queue
+    stay as they are; only the CLI session (and its context) starts over.
+    """
+    old = pid_holder[0]
+    restart_event.set()  # relaunch even under --no-restart
+    if old is not None:
+        kill_fn(old)
+    waited = 0.0
+    while pid_holder[0] is None or pid_holder[0] == old:
+        if waited >= timeout:
+            restart_event.clear()
+            raise RuntimeError("CLI did not relaunch")
+        sleep(0.5)
+        waited += 0.5
+    sleep(boot_grace)  # let the new CLI reach its prompt before a wake is typed
+
 
 def _fetch_role(server_port: int, agent_name: str) -> str:
     """Fetch this agent's role from the server status endpoint."""
@@ -861,9 +921,17 @@ def _defer_queue_injection(get_activity_fn, processing: Path) -> bool:
 
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
-                   refresh_interval: int = 10, get_activity_fn=None):
-    """Poll queue file and inject an MCP read task when triggered."""
-    first_mention = True
+                   refresh_interval: int = 10, get_activity_fn=None,
+                   session_state_path: Path | None = None, get_session_fn=None,
+                   restart_fn=None):
+    """Poll queue file and inject an MCP read task when triggered.
+
+    The first wake of each CLI session (identified by get_session_fn) asks for
+    chat_join and the summary; session_state_path records that it was sent, so
+    a restarted watcher does not ask again. A queued restart entry runs
+    restart_fn before any wake-up in the same batch.
+    """
+    greeted = None  # used when no state file is configured
     last_rules_epoch = 0  # 0 = unknown/cold start; inject on first trigger
     trigger_count = 0
     while True:
@@ -880,8 +948,18 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
 
             if processing.exists():
                 lines = processing.read_text("utf-8").splitlines(keepends=True)
-                groups = _group_queue_triggers(lines)
-                if not groups:
+                wakes = [line for line in lines if not _is_restart_line(line)]
+                if len(wakes) < len(lines):
+                    if _defer_queue_injection(get_activity_fn, processing):
+                        wakes = None  # hold everything until the agent is idle
+                    else:
+                        if restart_fn is not None:
+                            restart_fn()  # raises on failure, keeping the queue
+                        temporary = processing.with_suffix(".processing.tmp")
+                        temporary.write_text("".join(wakes), encoding="utf-8")
+                        os.replace(temporary, processing)
+                groups = _group_queue_triggers(wakes or [])
+                if wakes is not None and not groups:
                     processing.unlink()
                 for index, ((channel, job_id, custom_prompt), _) in enumerate(groups):
                     if _defer_queue_injection(get_activity_fn, processing):
@@ -893,9 +971,17 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     if custom_prompt:
                         prompt = custom_prompt
                     elif job_id:
-                        prompt = f"use mcp to read job_id={job_id} - you're mentioned in a job thread, take appropriate action and respond"
+                        prompt = f"use mcp to read job_id={job_id} - you're mentioned in a job thread, take appropriate action and respond."
                     else:
-                        prompt = f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond"
+                        prompt = f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond."
+                    prompt += " " + _WAKE_STEPS
+
+                    session = str(get_session_fn()) if get_session_fn else "default"
+                    stored = (_session_marker(session_state_path)
+                              if session_state_path is not None else greeted)
+                    new_session = stored != session
+                    if new_session:
+                        prompt = _NEW_SESSION_STEPS.format(channel=channel) + prompt
 
                     current_name, _ = get_identity_fn()
                     role = _fetch_role(server_port, current_name)
@@ -911,23 +997,28 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     if rules_data:
                         ri = rules_data.get("refresh_interval", refresh_interval)
                         sync_rules = (
-                            last_rules_epoch == 0
+                            new_session
+                            or last_rules_epoch == 0
                             or rules_data["epoch"] != last_rules_epoch
                             or (ri > 0 and trigger_count % ri == 0)
                         )
                         if sync_rules and rules_data["rules"]:
                             prompt += f"\n\nRULES: {'; '.join(rules_data['rules'])}"
 
-                    include_identity_hint = first_mention and is_multi_instance
-                    if include_identity_hint:
+                    if new_session and is_multi_instance:
                         prompt += _IDENTITY_HINT
                     # Flatten to one line to avoid CLI paste detection.
                     if inject_fn(prompt.replace("\n", " ")) is False:
                         raise RuntimeError("CLI injection failed")
                     if trigger_flag is not None:
                         trigger_flag[0] = True
-                    if include_identity_hint:
-                        first_mention = False
+                    if new_session:
+                        greeted = session
+                        if session_state_path is not None:
+                            try:
+                                _save_session_marker(session_state_path, session)
+                            except OSError:
+                                pass  # worst case the next wake asks to join again
                     if sync_rules:
                         last_rules_epoch = rules_data["epoch"]
                         _report_rule_sync(server_port, current_name, last_rules_epoch, token)
@@ -1220,6 +1311,32 @@ def main():
             return {"active": True, "waiting_approval": False}
         return _activity_report
 
+    # The CLI session is this wrapper process plus the CLI launch; a relaunched
+    # wrapper or a restarted CLI is a new session that should join and catch up.
+    _agent_pid = [None]
+    _restart_event = threading.Event()
+    # Not in the token folder: creating that folder here would skip its ACL setup.
+    _session_marker_path = data_dir / (
+        f"{agent}-{registration.get('identity_id') or assigned_name}.session.json")
+
+    def _kill_cli(pid):
+        import subprocess
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+        else:
+            subprocess.run(["tmux", "kill-session", "-t", unix_session_name], capture_output=True)
+
+    def restart_cli():
+        current_name, _ = get_identity()
+        print(f"\n  New task: restarting {current_name}'s CLI session...")
+        _restart_cli(_agent_pid, _restart_event, _kill_cli)
+
+    _session_kwargs = {
+        "session_state_path": _session_marker_path,
+        "get_session_fn": lambda: f"{os.getpid()}:{_agent_pid[0]}",
+        "restart_fn": restart_cli,
+    }
+
     def start_watcher(inject_fn):
         nonlocal _watcher_inject_fn, _watcher_thread
         _watcher_inject_fn = inject_fn
@@ -1229,7 +1346,7 @@ def main():
             kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                     "server_port": server_port, "agent_name": assigned_name,
                     "get_token_fn": get_token, "refresh_interval": _refresh_interval,
-                    "get_activity_fn": get_activity_report},
+                    "get_activity_fn": get_activity_report, **_session_kwargs},
             daemon=True,
         )
         _watcher_thread.start()
@@ -1245,7 +1362,7 @@ def main():
                     kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                             "server_port": server_port, "agent_name": assigned_name,
                             "get_token_fn": get_token, "refresh_interval": _refresh_interval,
-                            "get_activity_fn": get_activity_report},
+                            "get_activity_fn": get_activity_report, **_session_kwargs},
                     daemon=True,
                 )
                 _watcher_thread.start()
@@ -1302,8 +1419,6 @@ def main():
 
     threading.Thread(target=_activity_monitor, daemon=True).start()
 
-    _agent_pid = [None]
-
     if sys.platform == "win32":
         from wrapper_windows import get_activity_checker, run_agent
 
@@ -1328,6 +1443,7 @@ def main():
         start_watcher=start_watcher,
         strip_env=list(strip_vars),
         pid_holder=_agent_pid,
+        restart_event=_restart_event,
         inject_env=inject_env,
         inject_delay=agent_cfg.get("inject_delay", 0.3),
     )

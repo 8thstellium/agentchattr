@@ -850,6 +850,20 @@ main#timeline {
     background: color-mix(in srgb, var(--bubble-color, var(--text-dim)) 15%, var(--bg-msg));
 }
 
+.msg-reactions:not(:empty) {
+    display: flex;
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.reaction-badge {
+    border: 1px solid var(--white-08);
+    border-radius: 10px;
+    padding: 1px 6px;
+    color: var(--text-dim);
+    font-size: 11px;
+}
+
 /* --- Bubble copy icon (top-right) --- */
 
 .bubble-copy {

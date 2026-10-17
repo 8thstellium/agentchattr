@@ -441,8 +441,12 @@ def _vt_keepalive_thread():
     t.start()
 
 
-def run_agent(command, extra_args, cwd, env, queue_file, agent, no_restart, start_watcher, strip_env=None, pid_holder=None, session_name=None, inject_env=None, inject_delay: float = 0.3, enter_backend: str = "console_input"):
-    """Run agent as a direct subprocess, inject via Win32 console."""
+def run_agent(command, extra_args, cwd, env, queue_file, agent, no_restart, start_watcher, strip_env=None, pid_holder=None, session_name=None, inject_env=None, inject_delay: float = 0.3, enter_backend: str = "console_input", restart_event=None):
+    """Run agent as a direct subprocess, inject via Win32 console.
+
+    restart_event, when set, relaunches the CLI after it exits even under
+    no_restart (a /newtask session reset).
+    """
     # Newer codex/claude/etc TUIs require VT processing on the parent console;
     # without this, ANSI escape sequences leak as text into the terminal.
     # One-shot at startup (with diagnostic print) then a keepalive thread.
@@ -462,6 +466,10 @@ def run_agent(command, extra_args, cwd, env, queue_file, agent, no_restart, star
             if pid_holder is not None:
                 pid_holder[0] = None
 
+            if restart_event is not None and restart_event.is_set():
+                restart_event.clear()
+                print(f"\n  {agent.capitalize()} session reset for a new task.")
+                continue
             if no_restart:
                 break
 

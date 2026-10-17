@@ -53,56 +53,35 @@ _ROLES_FILE: Path | None = None
 _CURSORS_FILE: Path | None = None
 
 _MCP_INSTRUCTIONS = (
-    "agentchattr — a shared chat channel for coordinating development between AI agents and humans. "
-    "Use chat_send to post messages. Use chat_read to check recent messages. "
-    "Use chat_join when you start a session to announce your presence. "
-    "Use chat_rules to list or propose shared rules (humans approve via the web UI). "
-    "Always use your own name as the sender — never impersonate other agents or humans.\n\n"
-    "CRITICAL — Sender Identity Rules:\n"
-    "Your BASE agent identity (used for chat_claim and chat_read) is:\n"
-    "  - All Anthropic products (Claude Code, claude-cli, etc.) → base: \"claude\"\n"
-    "  - All OpenAI products (Codex CLI, codex, chatgpt-cli, etc.) → base: \"codex\"\n"
-    "  - All Google products (Gemini CLI, gemini-cli, aistudio, etc.) → base: \"gemini\"\n"
-    "  - All Alibaba/Qwen products (Qwen Code, qwen-cli, etc.) → base: \"qwen\"\n"
-    "  - All Kilo products (Kilo CLI, kilocode, etc.) → base: \"kilo\"\n"
-    "  - Humans use their own name (e.g. \"user\")\n"
-    "Do NOT use your CLI tool name (e.g. \"gemini-cli\", \"claude-code\") — use the base name above.\n"
-    "IMPORTANT: When multiple instances run, the server renames slot 1 (e.g. \"claude\" → \"claude-1\"). "
-    "If chat_send rejects your sender, call chat_claim(sender='your_base_name') and use the confirmed_name "
-    "as your sender for ALL subsequent tool calls. The confirmed_name overrides the base name.\n\n"
-    "CRITICAL — Identity:\n"
-    "Always use your base agent name (claude/codex/gemini/qwen/kilo) as sender. "
-    "Do NOT call chat_claim on fresh sessions — it is only for "
-    "recovering a previous identity after /resume.\n\n"
-    "CRITICAL — Always Respond In Chat:\n"
-    "When you are addressed in a chat message (@yourname or @all agents), you MUST respond using chat_send "
-    "in the same channel. NEVER respond only in your terminal/console output. The human and other agents "
-    "cannot see your terminal — only chat messages are visible to everyone. If you need to do work first, "
-    "do the work, then post your response/results in chat using chat_send.\n\n"
-    "CRITICAL — Token-Aware Reading:\n"
-    "Each chat_read call costs tokens. Default: one read per relevant channel per turn. "
-    "A second read is fine if you can name the reason (checked a different channel, did work and expect a reply, "
-    "recovering from an error). After an empty read ('No new messages'), do NOT read the same channel again — "
-    "stop and wait for your next prompt. Never use chat_read as a sleep/wait loop.\n\n"
-    "Rules are the shared working style for your agents. They are short imperative instructions that all agents should follow. "
-    "At session start, call chat_rules(action='list') to read active rules — treat them as authoritative guidance. "
-    "When you notice a repeated correction, a cross-agent convention, or a preference that should persist, "
-    "propose it as a rule via chat_rules(action='propose'). Keep rules short and imperative (max 160 chars). "
-    "Don't propose trivial or session-specific things. chat_decision is an alias for chat_rules (backward compat).\n\n"
-    "Messages belong to channels (default: 'general'). Use the 'channel' parameter in chat_send and "
-    "chat_read to target a specific channel. Omit channel or pass empty string to read from all channels.\n\n"
-    "If you are addressed in chat, respond in chat — use chat_send to reply in the same channel. "
-    "Do not take the answer back to your terminal session. "
-    "If the latest message in a channel is addressed to you (or all agents), treat it as your active task "
-    "and execute it directly. Reading a channel with no task addressed to you is just catching up — no action needed.\n\n"
-    "Multi-instance support:\n"
-    "When multiple instances of the same agent run simultaneously, each gets a unique identity.\n"
-    "The server assigns names like claude-1, claude-2 automatically.\n"
-    "On /resume, if your conversation history shows you previously used a different name (e.g. 'claude-music'), "
-    "call chat_claim(sender='your_base_name', name='claude-music') to reclaim it.\n"
-    "If chat_send rejects your sender with an identity error, call chat_claim first to get your identity.\n\n"
-    "Summaries are per-channel snapshots that help agents catch up quickly. "
-    "Use chat_summary(action='read') at session start to get context before reading raw messages. "
+    "agentchattr — a shared chat room where AI agents and humans coordinate development. "
+    "Post with chat_send, read with chat_read. Messages belong to channels (default: 'general'); "
+    "pass 'channel' to target one, or omit it on chat_read to read all channels.\n\n"
+    "Identity: your sender is your base name — Anthropic products (Claude Code etc.) → \"claude\"; "
+    "OpenAI (Codex CLI etc.) → \"codex\"; Google (Gemini CLI etc.) → \"gemini\"; Alibaba/Qwen → \"qwen\"; "
+    "Kilo → \"kilo\"; humans use their own name. Never use a CLI tool name (e.g. \"claude-code\") and never "
+    "impersonate another agent or human. With several instances the server renames slots (e.g. \"claude-1\"): "
+    "if chat_send rejects your sender, call chat_claim(sender='your_base_name') and use the confirmed_name "
+    "for all later calls. After /resume, if your history shows an earlier name (e.g. 'claude-music'), reclaim it "
+    "with chat_claim(sender='your_base_name', name='claude-music'). Otherwise do not call chat_claim.\n\n"
+    "Wake-ups: the room wakes you with a prompt when you are mentioned; follow it. On a new session it asks "
+    "you to call chat_join and read the channel summary, and it includes the active rules whenever they change, "
+    "so do not call chat_join, chat_who, chat_rules or chat_summary on every wake. "
+    "Read once per relevant channel per turn, passing your sender name so you get only unread messages. "
+    "A second read needs a reason you can name (a different channel, or you did work and expect a reply). "
+    "After an empty read ('No new messages'), stop. Never sleep, poll or re-read to wait: end your turn, "
+    "and the room wakes you when there is something new.\n\n"
+    "Always respond in chat: when addressed (@yourname or @all agents), reply with chat_send in the same channel "
+    "or job. Humans and other agents cannot see your terminal. If the latest message addressed to you is a task, "
+    "do the work, then post the result. Reading a channel with nothing addressed to you is just catching up.\n\n"
+    "Mentions wake the other agent for a full turn: acknowledge with "
+    "chat_react(msg_id=<id>, emoji='✅', sender=<your name>) instead of a message, "
+    "never @mention just to acknowledge, @mention another agent only when they must act, "
+    "and batch your points into one message.\n\n"
+    "Rules are the room's shared working style; treat them as authoritative. When you notice a repeated "
+    "correction or a convention that should persist, propose it with chat_rules(action='propose') "
+    "(short and imperative, max 160 chars; nothing trivial or session-specific; humans approve it). "
+    "chat_decision is an alias for chat_rules.\n\n"
+    "Summaries are per-channel snapshots for catching up. "
     "Use chat_summary(action='write', text='...') to update the summary ONLY when:\n"
     "- You are explicitly asked via /summary\n"
     "- The channel has had 20+ messages since the last summary\n"
@@ -390,6 +369,25 @@ def chat_propose_job(
     return f"Proposed job (msg_id={msg['id']}): {title}"
 
 
+def chat_react(msg_id: int, emoji: str, sender: str, ctx: Context | None = None) -> str:
+    """React to an existing message without adding a message or waking agents.
+
+    Reactions are visible in the web UI and omitted from chat_read output.
+    Repeating the same sender and emoji is idempotent.
+    """
+    sender, err = _resolve_tool_identity(sender, ctx, field_name="sender", required=True)
+    if err:
+        return err
+    if registry and registry.is_pending(sender):
+        return "Error: identity not confirmed. Call chat_claim(sender=your_base_name) to get your identity."
+    emoji = emoji.strip()
+    if not emoji or len(emoji) > 16:
+        return "Error: emoji must be 1 to 16 characters."
+    if not store.react(msg_id, emoji, sender):
+        return f"Error: message #{msg_id} not found."
+    return f"Reacted to message #{msg_id} with {emoji}."
+
+
 def _resolve_attachments(attachments: list[dict]) -> list[dict]:
     """Add absolute file_path to attachments so agents can read images."""
     if not attachments:
@@ -409,14 +407,31 @@ def _resolve_attachments(attachments: list[dict]) -> list[dict]:
     return resolved
 
 
-def _serialize_messages(msgs: list[dict]) -> str:
+def _read_text(text: str, msg_id: int, max_chars: int, full: bool,
+               recovery: str | None = None) -> str:
+    if full or len(text) <= max_chars:
+        return text
+    remaining = len(text) - max_chars
+    recovery = recovery or f"chat_read(since_id={msg_id - 1}, limit=1, full=true)"
+    return text[:max_chars] + f"[… {remaining} more chars; {recovery} for full text]"
+
+
+def _max_read_chars() -> int:
+    configured = (config or {}).get("chat", {}).get("max_read_chars", 2000)
+    try:
+        return max(1, int(configured))
+    except (TypeError, ValueError):
+        return 2000
+
+
+def _serialize_messages(msgs: list[dict], *, full: bool = False) -> str:
     """Serialize store messages into MCP chat_read output shape."""
     out = []
     for m in msgs:
         entry = {
             "id": m["id"],
             "sender": m["sender"],
-            "text": m["text"],
+            "text": _read_text(m["text"], m["id"], _max_read_chars(), full),
             "type": m["type"],
             "time": m["time"],
             "channel": m.get("channel", "general"),
@@ -622,6 +637,7 @@ def chat_read(
     limit: int = 20,
     channel: str = "",
     job_id: int = 0,
+    full: bool = False,
     ctx: Context | None = None,
 ) -> str:
     """Read chat messages. Returns JSON array with: id, sender, text, type, time, channel.
@@ -633,7 +649,9 @@ def chat_read(
     - Omit sender to always get the last `limit` messages (no cursor).
     - Pass channel to filter by channel name (default: all channels).
     - Pass job_id to read a specific job. Job reads return a header entry first,
-      including title and body, followed by the thread messages."""
+      including title and body, followed by the thread messages.
+    - Text over the configured read cap is truncated. Pass full=True with the
+      indicated since_id and limit=1 to recover one complete message."""
     sender, err = _resolve_tool_identity(sender, ctx, field_name="sender", required=False)
     if err:
         return err
@@ -654,22 +672,25 @@ def chat_read(
         header_text = f"Job: {title}" if title else f"Job #{job_id}"
         if body:
             header_text += f"\nDescription: {body}"
+        max_chars = _max_read_chars()
+        recovery = f"chat_read(job_id={job_id}, full=true)"
         out = [{
             "id": -1,
             "sender": "system",
-            "text": header_text,
+            "text": _read_text(header_text, -1, max_chars, full, recovery),
             "type": "job_header",
             "time": "",
             "job_id": job_id,
             "title": title,
-            "body": body,
+            "body": _read_text(body, -1, max_chars, full, recovery),
             "status": job.get("status", ""),
             "channel": job.get("channel", ""),
             "created_by": job.get("created_by", ""),
             "assignee": job.get("assignee", ""),
         }]
         for m in msgs:
-            entry = {"id": m["id"], "sender": m["sender"], "text": m["text"],
+            entry = {"id": m["id"], "sender": m["sender"],
+                     "text": _read_text(m["text"], m["id"], max_chars, full, recovery),
                      "time": m.get("time", ""), "job_id": job_id}
             if m.get("attachments"):
                 entry["attachments"] = _resolve_attachments(m["attachments"])
@@ -718,7 +739,7 @@ def chat_read(
     else:
         msgs = msgs[-limit:]
     _update_cursor(sender, msgs, ch)
-    serialized = _serialize_messages(msgs)
+    serialized = _serialize_messages(msgs, full=full)
     if remaining:
         # An explicit since_id page may sit behind the default cursor, so a
         # plain follow-up read would skip ahead; point at the next since_id.
@@ -1022,7 +1043,7 @@ def chat_summary(
 
 
 _ALL_TOOLS = [
-    chat_send, chat_read, chat_resync, chat_join, chat_who, chat_rules, chat_decision,
+    chat_send, chat_react, chat_read, chat_resync, chat_join, chat_who, chat_rules, chat_decision,
     chat_channels, chat_set_hat, chat_claim, chat_summary, chat_propose_job,
 ]
 

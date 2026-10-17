@@ -330,6 +330,7 @@ def configure(cfg: dict, session_token: str = ""):
     # Bridge: when ANY message is added to store (including via MCP),
     # broadcast to all WebSocket clients
     store.on_message(_on_store_message)
+    store.on_reaction(_on_store_reaction)
 
     _load_settings()
     _load_hats()
@@ -564,6 +565,20 @@ def _on_store_message(msg: dict):
     asyncio.run_coroutine_threadsafe(_handle_new_message(msg), _event_loop)
 
 
+def _on_store_reaction(msg_id: int, reactions: dict):
+    """Broadcast a reaction change without passing it through message routing."""
+    if _event_loop is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        if loop is _event_loop:
+            asyncio.ensure_future(broadcast_reaction(msg_id, reactions))
+            return
+    except RuntimeError:
+        pass
+    asyncio.run_coroutine_threadsafe(broadcast_reaction(msg_id, reactions), _event_loop)
+
+
 def _on_rule_change(action: str, rule: dict):
     """Called from any thread when a rule changes."""
     if _event_loop is None:
@@ -748,6 +763,13 @@ async def _handle_new_message(msg: dict):
         await _resume_routing(channel)
         return
 
+    if cmd_word == "/newtask":
+        if sender in known_agents:
+            store.add("system", f"Only humans can /newtask. {sender} tried to reset the sessions.", channel=channel)
+            return
+        await _start_new_task(sender, text, channel)
+        return
+
     if stripped == "/roastreview":
         agent_names = registry.get_all_names() if registry else list(config.get("agents", {}).keys())
         mentions = " ".join(f"@{a}" for a in agent_names)
@@ -852,6 +874,23 @@ async def _handle_new_message(msg: dict):
     custom_prompt = text if is_hidden_session_request else ""
     await _route_mentions(sender, text, channel, origin=origin,
                           custom_prompt=custom_prompt, known_agents=known_agents)
+
+
+async def _start_new_task(sender: str, text: str, channel: str):
+    """Task boundary: clear the loop guard and restart every agent's CLI session.
+
+    Wrappers keep their identity and queued wake-ups; the chat is the shared memory.
+    """
+    parts = _re.sub(r"@[\w-]+\s*", "", text).strip().split(None, 1)
+    name = parts[1].strip() if len(parts) > 1 else ""
+    router.reset_all()  # blocked hops in any channel belong to the finished task
+    agent_names = registry.get_all_names() if registry else list(config.get("agents", {}).keys())
+    for agent_name in agent_names:
+        agents.request_restart(agent_name)
+    title = f"New task: {name}" if name else "New task"
+    store.add("system", f"{title} (started by {sender}). Agent sessions are restarting; "
+              "the chat history stays as shared context.", channel=channel)
+    await broadcast_status()
 
 
 async def _resume_routing(channel: str):
@@ -1001,6 +1040,10 @@ async def broadcast_todo_update(msg_id: int, status: str | None):
         except Exception:
             dead.add(client)
     ws_clients.difference_update(dead)
+
+
+async def broadcast_reaction(msg_id: int, reactions: dict):
+    await _broadcast(json.dumps({"type": "reaction", "data": {"id": msg_id, "reactions": reactions}}))
 
 
 async def broadcast_settings():
@@ -1206,6 +1249,14 @@ async def websocket_endpoint(websocket: WebSocket):
                             continue
                         store.add("system", "Resuming agent conversation...", msg_type="system", channel=channel)
                         await _resume_routing(channel)
+                        continue
+                    if cmd == "/newtask":
+                        known_agents = set(registry.get_all_names()) if registry else set()
+                        known_agents.update(config.get("agents", {}).keys())
+                        if sender in known_agents:
+                            store.add("system", f"Only humans can /newtask. {sender} tried to reset the sessions.", channel=channel)
+                            continue
+                        await _start_new_task(sender, text, channel)
                         continue
                     # Broadcast slash commands — expand without storing the raw command.
                     # _handle_new_message will store the expanded version.

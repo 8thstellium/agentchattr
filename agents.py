@@ -54,6 +54,14 @@ class AgentTrigger:
 
         log.info("Queued @%s trigger (ch=%s, job=%s): %s", agent_name, channel, job_id, message[:80])
 
+    def request_restart(self, agent_name: str):
+        """Queue a CLI session restart; the wrapper runs it before later wake-ups."""
+        queue_file = self._data_dir / f"{agent_name}_queue.jsonl"
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        with open(queue_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "restart"}) + "\n")
+        log.info("Queued @%s session restart", agent_name)
+
     def trigger_sync(self, agent_name: str, message: str = "", channel: str = "general",
                      job_id: int | None = None, **kwargs):
         """Synchronous version of trigger — writes to queue file without async."""

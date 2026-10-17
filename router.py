@@ -106,6 +106,11 @@ class Router:
         blocked, ch["blocked"] = ch["blocked"], []
         return blocked
 
+    def reset_all(self):
+        """Clear the guard in every channel, dropping blocked hops (a new task)."""
+        for channel in list(self._channels):
+            self.continue_routing(channel)
+
     def is_paused(self, channel: str = "general") -> bool:
         return self._get_ch(channel)["paused"]
 
