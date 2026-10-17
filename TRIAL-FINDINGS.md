@@ -31,3 +31,7 @@ Reproduced in a scripted trial with Claude Code 2.1.302 and Codex CLI 0.163.0. F
 - Keep changes small and covered by tests in `tests/` (`.venv\Scripts\python.exe -m unittest discover -s tests`, the repo venv; the bare interpreter lacks fastapi/mcp). Baseline: OK, 4 skipped.
 - Don't change the MCP tool surface or config keys without a reason; existing users rely on them.
 - Reviewer must actually run the suite and say which command it ran; claims are checked against session logs.
+
+## F7 — The Windows injector's leading ESC can cancel a running turn (found 17 Oct, 12:01)
+- `wrapper_windows.inject` sends ESC to clear the composer before typing a wake prompt. When a trigger arrives while the agent is mid-turn (streaming or thinking rather than running a tool), that ESC interrupts the turn: Claude Code showed "Interrupted · What should Claude do instead?" with an empty composer, and the injected prompt was lost.
+- Not yet fixed. Fix direction: don't inject while the activity checker reports the agent busy (queue until idle), or clear the composer with a method that cannot interrupt (e.g. Ctrl+U / select-all+delete) instead of ESC.
