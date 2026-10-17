@@ -1,7 +1,9 @@
 """Queued wake prompts survive restarts, failures, and mixed destinations."""
 
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,7 +30,7 @@ class QueueDeliveryTests(unittest.TestCase):
         with self.queue.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry) + "\n")
 
-    def run_polls(self, inject, polls=1):
+    def run_polls(self, inject, polls=1, activity=None):
         completed = 0
 
         def sleep(seconds):
@@ -41,8 +43,10 @@ class QueueDeliveryTests(unittest.TestCase):
         with (patch.object(wrapper.time, "sleep", side_effect=sleep),
               patch.object(wrapper, "_fetch_role", return_value=""),
               patch.object(wrapper, "_fetch_active_rules", return_value=None)):
+            kwargs = {"get_activity_fn": activity} if activity is not None else {}
             with self.assertRaises(_StopWatcher):
-                wrapper._queue_watcher(lambda: ("claude", self.queue), inject)
+                wrapper._queue_watcher(lambda: ("claude", self.queue), inject,
+                                       **kwargs)
 
     def test_existing_queue_is_delivered_on_watcher_start(self):
         self.append()
@@ -134,6 +138,72 @@ class QueueDeliveryTests(unittest.TestCase):
             self.run_polls(prompts.append, polls=2)
         self.assertEqual(len(prompts), 1)
         self.assertIn("read #work", prompts[0])
+
+    def test_active_agent_holds_processing_until_idle(self):
+        self.append(channel="work")
+        state = {"active": True, "waiting_approval": False}
+        prompts = []
+        self.run_polls(prompts.append, activity=lambda: state)
+        self.assertEqual(prompts, [])
+        self.assertTrue(self.queue.with_suffix(".processing").exists())
+        state["active"] = False
+        self.run_polls(prompts.append, activity=lambda: state)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("read #work", prompts[0])
+        self.assertFalse(self.queue.with_suffix(".processing").exists())
+
+    def test_second_group_remains_after_first_injection_makes_agent_active(self):
+        self.append(channel="first")
+        self.append(channel="second")
+        state = {"active": False, "waiting_approval": False}
+        prompts = []
+
+        def inject(prompt):
+            prompts.append(prompt)
+            state["active"] = True
+
+        self.run_polls(inject, activity=lambda: state)
+        self.assertEqual(len(prompts), 1)
+        processing = self.queue.with_suffix(".processing")
+        self.assertTrue(processing.exists())
+        self.assertIn('"channel": "second"', processing.read_text("utf-8"))
+        self.assertNotIn('"channel": "first"', processing.read_text("utf-8"))
+
+        state["active"] = False
+        self.run_polls(inject, activity=lambda: state)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("read #second", prompts[1])
+        self.assertFalse(processing.exists())
+
+    def test_waiting_approval_holds_even_after_active_timeout(self):
+        self.append(channel="work")
+        past = time.time() - 600
+        os.utime(self.queue, (past, past))
+        prompts = []
+        self.run_polls(prompts.append,
+                       activity=lambda: {"active": False, "waiting_approval": True})
+        self.assertEqual(prompts, [])
+        self.assertTrue(self.queue.with_suffix(".processing").exists())
+
+    def test_stale_active_report_eventually_injects_without_losing_queue(self):
+        self.append(channel="work")
+        past = time.time() - 600
+        os.utime(self.queue, (past, past))
+        prompts = []
+        self.run_polls(prompts.append,
+                       activity=lambda: {"active": True, "waiting_approval": False})
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("read #work", prompts[0])
+        self.assertFalse(self.queue.with_suffix(".processing").exists())
+
+    def test_false_injection_result_preserves_processing_for_retry(self):
+        self.append(channel="work")
+        self.run_polls(lambda _prompt: False)
+        self.assertTrue(self.queue.with_suffix(".processing").exists())
+        prompts = []
+        self.run_polls(prompts.append)
+        self.assertEqual(len(prompts), 1)
+        self.assertFalse(self.queue.with_suffix(".processing").exists())
 
 
 if __name__ == "__main__":

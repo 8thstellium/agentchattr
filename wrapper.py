@@ -839,9 +839,29 @@ def _group_queue_triggers(lines: list[str]) -> list[tuple[tuple, list[str]]]:
     return list(groups.items())
 
 
+MAX_ACTIVE_DEFER_SECONDS = 180
+
+
+def _defer_queue_injection(get_activity_fn, processing: Path) -> bool:
+    """Keep the queued prompt while the agent is busy or awaiting approval.
+
+    The processing file's mtime survives watcher restarts and bounds an
+    erroneously persistent active report. Approval prompts are never forced:
+    an injected Enter could approve a command.
+    """
+    if get_activity_fn is None:
+        return False
+    report = get_activity_fn()
+    if report and report.get("waiting_approval"):
+        return True
+    if report is not None and not report.get("active"):
+        return False
+    return time.time() - processing.stat().st_mtime < MAX_ACTIVE_DEFER_SECONDS
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
-                   refresh_interval: int = 10):
+                   refresh_interval: int = 10, get_activity_fn=None):
     """Poll queue file and inject an MCP read task when triggered."""
     first_mention = True
     last_rules_epoch = 0  # 0 = unknown/cold start; inject on first trigger
@@ -864,9 +884,11 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 if not groups:
                     processing.unlink()
                 for index, ((channel, job_id, custom_prompt), _) in enumerate(groups):
-                    if trigger_flag is not None:
-                        trigger_flag[0] = True
+                    if _defer_queue_injection(get_activity_fn, processing):
+                        break
                     time.sleep(0.5)
+                    if _defer_queue_injection(get_activity_fn, processing):
+                        break
 
                     if custom_prompt:
                         prompt = custom_prompt
@@ -900,7 +922,10 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     if include_identity_hint:
                         prompt += _IDENTITY_HINT
                     # Flatten to one line to avoid CLI paste detection.
-                    inject_fn(prompt.replace("\n", " "))
+                    if inject_fn(prompt.replace("\n", " ")) is False:
+                        raise RuntimeError("CLI injection failed")
+                    if trigger_flag is not None:
+                        trigger_flag[0] = True
                     if include_identity_hint:
                         first_mention = False
                     if sync_rules:
@@ -1185,7 +1210,15 @@ def main():
     _watcher_thread = None
     _is_multi_instance = registration.get("slot", 1) > 1
     _trigger_flag = [False]  # shared: queue watcher sets True, activity checker reads
+    _activity_report = None  # latest result from the activity checker
     _refresh_interval = 10  # default; overridden per-trigger by server settings
+
+    def get_activity_report():
+        # An injection that the checker has not consumed yet is already active.
+        # Before the first checker poll, hold queued prompts rather than guess idle.
+        if _trigger_flag[0]:
+            return {"active": True, "waiting_approval": False}
+        return _activity_report
 
     def start_watcher(inject_fn):
         nonlocal _watcher_inject_fn, _watcher_thread
@@ -1195,7 +1228,8 @@ def main():
             args=(get_identity, inject_fn),
             kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                     "server_port": server_port, "agent_name": assigned_name,
-                    "get_token_fn": get_token, "refresh_interval": _refresh_interval},
+                    "get_token_fn": get_token, "refresh_interval": _refresh_interval,
+                    "get_activity_fn": get_activity_report},
             daemon=True,
         )
         _watcher_thread.start()
@@ -1210,7 +1244,8 @@ def main():
                     args=(get_identity, _watcher_inject_fn),
                     kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                             "server_port": server_port, "agent_name": assigned_name,
-                            "get_token_fn": get_token, "refresh_interval": _refresh_interval},
+                            "get_token_fn": get_token, "refresh_interval": _refresh_interval,
+                            "get_activity_fn": get_activity_report},
                     daemon=True,
                 )
                 _watcher_thread.start()
@@ -1226,6 +1261,7 @@ def main():
         _activity_checker = checker
 
     def _activity_monitor():
+        nonlocal _activity_report
         last_state = None
         last_report_time = 0
         REPORT_INTERVAL = 3  # re-send state every 3s while active (keeps server lease fresh)
@@ -1235,6 +1271,7 @@ def main():
                 continue
             try:
                 report = _build_activity_report(_activity_checker)
+                _activity_report = report
                 state = (report["active"], report["waiting_approval"])
                 now = time.time()
                 # Send on state change, periodically while active (refresh lease),

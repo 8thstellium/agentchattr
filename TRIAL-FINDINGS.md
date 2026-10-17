@@ -32,6 +32,7 @@ Reproduced in a scripted trial with Claude Code 2.1.302 and Codex CLI 0.163.0. F
 - Don't change the MCP tool surface or config keys without a reason; existing users rely on them.
 - Reviewer must actually run the suite and say which command it ran; claims are checked against session logs.
 
-## F7 — The Windows injector's leading ESC can cancel a running turn (found 17 Oct, 12:01)
-- `wrapper_windows.inject` sends ESC to clear the composer before typing a wake prompt. When a trigger arrives while the agent is mid-turn (streaming or thinking rather than running a tool), that ESC interrupts the turn: Claude Code showed "Interrupted · What should Claude do instead?" with an empty composer, and the injected prompt was lost.
-- Not yet fixed. Fix direction: don't inject while the activity checker reports the agent busy (queue until idle), or clear the composer with a method that cannot interrupt (e.g. Ctrl+U / select-all+delete) instead of ESC.
+## F7 — A wake prompt injected while the agent is mid-turn can be lost (found 17 Oct, 12:01)
+- Observed once: a trigger arrived while Claude Code was mid-turn; the console then showed "Interrupted · What should Claude do instead?" with an empty composer, and the injected prompt was gone.
+- **Cause not established.** The first note here blamed a leading ESC in `wrapper_windows.inject`; Codex checked and the injector sends no ESC (it writes the text and VK_RETURN; the Unix path's only ESC bytes are bracketed-paste framing). The lone-ESC-on-focus behaviour mentioned in `enable_vt_mode`'s docstring is a candidate, unverified.
+- **Mitigation implemented (wrapper.py):** the queue watcher no longer injects while the activity monitor reports the agent active or waiting for approval; the group stays in `.processing` and is retried each poll, acknowledged only after a successful inject (F2 semantics). An active state older than 180 s (measured from the `.processing` file's mtime) forces the inject so a misread can't starve delivery; an approval wait is never forced. Tests in `tests/test_queue_delivery.py`.
