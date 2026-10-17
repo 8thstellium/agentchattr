@@ -28,6 +28,6 @@ Reproduced in a scripted trial with Claude Code 2.1.302 and Codex CLI 0.163.0. F
 - `router.continue_routing()` resets state; nothing re-delivers the message whose routing was blocked, so the chain only resumes on a new human mention.
 
 ## Constraints for the fix
-- Keep changes small and covered by tests in `tests/` (`.venvScriptspython.exe -m unittest discover -s tests` (the repo venv; the bare interpreter lacks fastapi/mcp)). Baseline: OK, 4 skipped.
+- Keep changes small and covered by tests in `tests/` (`.venv\Scripts\python.exe -m unittest discover -s tests`, the repo venv; the bare interpreter lacks fastapi/mcp). Baseline: OK, 4 skipped.
 - Don't change the MCP tool surface or config keys without a reason; existing users rely on them.
 - Reviewer must actually run the suite and say which command it ran; claims are checked against session logs.
