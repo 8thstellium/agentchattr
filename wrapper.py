@@ -163,6 +163,15 @@ _BUILTIN_DEFAULTS: dict[str, dict] = {
 _VALID_INJECT_MODES = {"settings_file", "env", "flag", "proxy_flag", "env_content"}
 
 
+def _needs_proxy(inject_mode: str) -> bool:
+    """Modes routed through the local MCP proxy.
+
+    flag (Claude, Kimi) and proxy_flag (Codex) use it, and so does no mode
+    (the fallback). settings_file, env and env_content still connect directly.
+    """
+    return inject_mode in ("flag", "proxy_flag", "")
+
+
 def _provider_from_command(command: object) -> str:
     """Return a built-in provider for an exact configured executable name.
 
@@ -287,13 +296,14 @@ def _apply_mcp_inject(
         inject_env[env_var] = str(settings_path)
 
     elif mode == "flag":
-        # Write a config file, pass it as a CLI flag
+        # Write a config file, pass it as a CLI flag. Points at the local
+        # proxy so the session survives a chat-server restart (F4b).
         flag = inject_cfg.get("mcp_flag", "--mcp-config")
         merge_project = inject_cfg.get("mcp_merge_project", False)
         project_servers = _read_project_mcp_servers(project_dir) if (merge_project and project_dir) else {}
         settings_path = _write_claude_mcp_config(
             config_dir / f"{instance_name}-mcp.json",
-            server_url, token=token, project_servers=project_servers,
+            proxy_url or server_url, token=token, project_servers=project_servers,
         )
         launch_args = [flag, str(settings_path)]
 
@@ -979,15 +989,14 @@ def main():
     proxy_url = None
 
     # Resolve MCP injection mode to determine if a proxy is needed.
-    # Direct-connect modes (settings_file, env, flag) don't need a proxy.
-    # proxy_flag mode needs a proxy. No mcp_inject = proxy fallback.
+    # See _needs_proxy for which modes connect directly.
     inject_cfg = _resolve_mcp_inject(agent, agent_cfg)
     inject_mode = inject_cfg.get("mcp_inject", "")
     if inject_mode and inject_mode not in _VALID_INJECT_MODES:
         print(f"  Error: unknown mcp_inject mode '{inject_mode}' for agent '{agent}'.")
         print(f"  Valid modes: {', '.join(sorted(_VALID_INJECT_MODES))}")
         sys.exit(1)
-    needs_proxy = inject_mode in ("proxy_flag", "") or not inject_mode
+    needs_proxy = _needs_proxy(inject_mode)
 
     if needs_proxy:
         from mcp_proxy import McpIdentityProxy
@@ -1036,7 +1045,7 @@ def main():
     # Most CLIs won't re-read mid-session, but the file is correct for next restart.
     def _rewrite_mcp_config(instance_name: str, new_token: str):
         if not inject_mode or needs_proxy:
-            return  # proxy-based agents don't have config files to rewrite
+            return  # the proxy URL is stable and the proxy stamps the new token
         try:
             _apply_mcp_inject(
                 inject_cfg, instance_name, data_dir, proxy_url,
@@ -1131,6 +1140,8 @@ def main():
             print(f"  Config: {mcp_settings_path}")
     elif proxy_url:
         print(f"  Local MCP proxy: {proxy_url}")
+        if mcp_settings_path:
+            print(f"  Config: {mcp_settings_path}")
     print(f"  @{assigned_name} mentions auto-inject MCP reads")
     print(f"  Starting {command} in {cwd}...\n")
 
