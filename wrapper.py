@@ -470,58 +470,53 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
         pass
 
 
+def _group_queue_triggers(lines: list[str]) -> list[tuple[tuple, list[str]]]:
+    """Group wake requests by destination while keeping first-seen order."""
+    groups: dict[tuple, list[str]] = {}
+    for line in lines:
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        channel = data.get("channel") or "general"
+        job_id = data.get("job_id")
+        raw_prompt = data.get("prompt", "")
+        custom_prompt = raw_prompt.strip() if isinstance(raw_prompt, str) else ""
+        key = (channel, job_id, custom_prompt)
+        groups.setdefault(key, []).append(line)
+    return list(groups.items())
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
                    refresh_interval: int = 10):
     """Poll queue file and inject an MCP read task when triggered."""
     first_mention = True
-    last_rules_epoch = 0  # 0 = unknown/cold start — will inject on first trigger
+    last_rules_epoch = 0  # 0 = unknown/cold start; inject on first trigger
     trigger_count = 0
     while True:
         try:
             _, queue_file = get_identity_fn()
-            if queue_file.exists() and queue_file.stat().st_size > 0:
-                with open(queue_file, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                queue_file.write_text("", "utf-8")
+            processing = queue_file.with_suffix(".processing")
+            if not processing.exists() and queue_file.exists() and queue_file.stat().st_size > 0:
+                try:
+                    # Rename before reading; new appends create a fresh queue file.
+                    os.replace(queue_file, processing)
+                except (FileNotFoundError, PermissionError):
+                    # On Windows a writer may still have the file open.
+                    pass
 
-                has_trigger = False
-                channel = "general"
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    has_trigger = True
-                    if isinstance(data, dict) and "channel" in data:
-                        channel = data["channel"]
-
-                if has_trigger:
-                    # Signal activity BEFORE injecting — covers the thinking phase
+            if processing.exists():
+                lines = processing.read_text("utf-8").splitlines(keepends=True)
+                groups = _group_queue_triggers(lines)
+                if not groups:
+                    processing.unlink()
+                for index, ((channel, job_id, custom_prompt), _) in enumerate(groups):
                     if trigger_flag is not None:
                         trigger_flag[0] = True
                     time.sleep(0.5)
-
-                    # Check if this is a job/activity-scoped trigger
-                    job_id = None
-                    custom_prompt = ""
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                            if isinstance(data, dict) and "job_id" in data:
-                                job_id = data["job_id"]
-                            if isinstance(data, dict):
-                                raw_prompt = data.get("prompt", "")
-                                if isinstance(raw_prompt, str) and raw_prompt.strip():
-                                    custom_prompt = raw_prompt.strip()
-                        except json.JSONDecodeError:
-                            pass
 
                     if custom_prompt:
                         prompt = custom_prompt
@@ -530,41 +525,48 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     else:
                         prompt = f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond"
 
-                    # Use current identity (may have changed via rename)
                     current_name, _ = get_identity_fn()
-                    # Append role if set — check both current name and base name
                     role = _fetch_role(server_port, current_name)
                     if not role and current_name != agent_name:
                         role = _fetch_role(server_port, agent_name)
                     if role:
                         prompt += f"\n\nROLE: {role}"
 
-                    # Smart rules injection: first trigger, epoch change, or periodic refresh
-                    _token = get_token_fn() if get_token_fn else ""
-                    rules_data = _fetch_active_rules(server_port, _token)
+                    token = get_token_fn() if get_token_fn else ""
+                    rules_data = _fetch_active_rules(server_port, token)
                     trigger_count += 1
+                    sync_rules = False
                     if rules_data:
-                        # Use server-side refresh_interval (live from settings UI)
                         ri = rules_data.get("refresh_interval", refresh_interval)
-                        need_inject = (
+                        sync_rules = (
                             last_rules_epoch == 0
                             or rules_data["epoch"] != last_rules_epoch
                             or (ri > 0 and trigger_count % ri == 0)
                         )
-                        if need_inject:
-                            if rules_data["rules"]:
-                                rules_text = "; ".join(rules_data["rules"])
-                                prompt += f"\n\nRULES:\n{rules_text}"
-                            last_rules_epoch = rules_data["epoch"]
-                            _report_rule_sync(server_port, current_name, rules_data["epoch"], _token)
+                        if sync_rules and rules_data["rules"]:
+                            prompt += f"\n\nRULES: {'; '.join(rules_data['rules'])}"
 
-                    if first_mention and is_multi_instance:
+                    include_identity_hint = first_mention and is_multi_instance
+                    if include_identity_hint:
                         prompt += _IDENTITY_HINT
-                        first_mention = False
-                    # Flatten to single line — multi-line text triggers paste
-                    # detection in CLIs (Claude Code shows "[Pasted text +N]")
-                    # which can break injection of long session prompts
+                    # Flatten to one line to avoid CLI paste detection.
                     inject_fn(prompt.replace("\n", " "))
+                    if include_identity_hint:
+                        first_mention = False
+                    if sync_rules:
+                        last_rules_epoch = rules_data["epoch"]
+                        _report_rule_sync(server_port, current_name, last_rules_epoch, token)
+
+                    # Acknowledge each destination only after injection succeeds.
+                    # Unacknowledged destinations survive failure or restart.
+                    remaining = [line for _, group_lines in groups[index + 1:]
+                                 for line in group_lines]
+                    if remaining:
+                        temporary = processing.with_suffix(".processing.tmp")
+                        temporary.write_text("".join(remaining), encoding="utf-8")
+                        os.replace(temporary, processing)
+                    else:
+                        processing.unlink()
         except Exception:
             pass
 
@@ -717,8 +719,6 @@ def main():
         return changed
 
     queue_file = _identity["queue"]
-    if queue_file.exists():
-        queue_file.write_text("", "utf-8")
 
     strip_vars = {"CLAUDECODE"} | set(agent_cfg.get("strip_env", []))
     env = {k: v for k, v in os.environ.items() if k not in strip_vars}
