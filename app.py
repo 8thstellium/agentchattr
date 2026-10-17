@@ -744,9 +744,8 @@ async def _handle_new_message(msg: dict):
         if sender in known_agents:
             store.add("system", f"Loop guard: only humans can /continue. {sender} tried to self-resume.", channel=channel)
             return
-        router.continue_routing(channel)
         store.add("system", f"Routing resumed by {sender}.", channel=channel)
-        await broadcast_status()
+        await _resume_routing(channel)
         return
 
     if stripped == "/roastreview":
@@ -849,7 +848,32 @@ async def _handle_new_message(msg: dict):
                            "errors": ["Invalid JSON in session block"], "valid": False},
             )
 
-    raw_targets = router.get_targets(sender, text, channel)
+    origin = {"sender": sender, "text": text, "msg_id": msg.get("id")}
+    custom_prompt = text if is_hidden_session_request else ""
+    await _route_mentions(sender, text, channel, origin=origin,
+                          custom_prompt=custom_prompt, known_agents=known_agents)
+
+
+async def _resume_routing(channel: str):
+    """Lift the loop-guard pause and re-deliver the messages it blocked."""
+    blocked = router.continue_routing(channel)
+    await broadcast_status()
+    known_agents = set(registry.get_all_names()) if registry else set()
+    known_agents.update(config.get("agents", {}).keys())
+    for origin in blocked:
+        # Routed again (hops counted again) without re-storing the message.
+        if origin.get("job_id"):
+            await _route_job_mentions(origin["sender"], origin["text"], channel,
+                                      origin["job_id"], origin=origin)
+        else:
+            await _route_mentions(origin["sender"], origin["text"], channel,
+                                  origin=origin, known_agents=known_agents)
+
+
+async def _route_mentions(sender: str, text: str, channel: str, *, origin: dict | None,
+                          custom_prompt: str = "", known_agents: set[str]):
+    """Resolve @mention targets for a message and trigger them."""
+    raw_targets = router.get_targets(sender, text, channel, origin=origin)
     # Resolve base family names to actual registered instances
     # e.g. 'claude' → 'claude-prime' when slot-1 was renamed
     targets = []
@@ -874,7 +898,6 @@ async def _handle_new_message(msg: dict):
 
     # Build a readable message string for the wake prompt
     chat_msg = f"{sender}: {text}" if text else ""
-    custom_prompt = text if is_hidden_session_request else ""
 
     # Session turn guard: if a session is active on this channel and the sender
     # is an agent, only allow triggering the agent whose turn it is.
@@ -1167,9 +1190,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         await broadcast_clear(channel=channel)
                         continue
                     if cmd == "/continue":
-                        router.continue_routing()
+                        known_agents = set(registry.get_all_names()) if registry else set()
+                        known_agents.update(config.get("agents", {}).keys())
+                        if sender in known_agents:
+                            store.add("system", f"Loop guard: only humans can /continue. {sender} tried to self-resume.", channel=channel)
+                            continue
                         store.add("system", "Resuming agent conversation...", msg_type="system", channel=channel)
-                        await broadcast_status()
+                        await _resume_routing(channel)
                         continue
                     # Broadcast slash commands — expand without storing the raw command.
                     # _handle_new_message will store the expanded version.
@@ -2021,27 +2048,33 @@ async def post_job_message(job_id: int, request: Request):
     job = jobs.get(job_id)
     if job:
         channel = job.get("channel", "general")
-        raw_targets = router.get_targets(sender, text, channel)
-        targets = []
-        for t in raw_targets:
-            if registry:
-                targets.extend(registry.resolve_to_instances(t))
-            else:
-                targets.append(t)
-        targets = list(dict.fromkeys(targets))
-
-        import mcp_bridge
-        chat_msg = f"{sender}: {text}" if text else ""
-        for target in targets:
-            if registry:
-                inst = registry.get_instance(target)
-                if inst and inst.get("state") == "pending":
-                    continue
-            if agents.is_available(target):
-                await agents.trigger(target, message=chat_msg, channel=channel,
-                                     job_id=job_id)
+        origin = {"sender": sender, "text": text, "msg_id": msg.get("id"), "job_id": job_id}
+        await _route_job_mentions(sender, text, channel, job_id, origin=origin)
 
     return msg
+
+
+async def _route_job_mentions(sender: str, text: str, channel: str, job_id: int, *,
+                              origin: dict | None):
+    """Trigger @mentioned agents for a job-thread message, keeping the job context."""
+    raw_targets = router.get_targets(sender, text, channel, origin=origin)
+    targets = []
+    for t in raw_targets:
+        if registry:
+            targets.extend(registry.resolve_to_instances(t))
+        else:
+            targets.append(t)
+    targets = list(dict.fromkeys(targets))
+
+    chat_msg = f"{sender}: {text}" if text else ""
+    for target in targets:
+        if registry:
+            inst = registry.get_instance(target)
+            if inst and inst.get("state") == "pending":
+                continue
+        if agents.is_available(target):
+            await agents.trigger(target, message=chat_msg, channel=channel,
+                                 job_id=job_id)
 
 
 @app.delete("/api/jobs/{job_id}/messages/{msg_id}")
